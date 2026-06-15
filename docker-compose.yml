@@ -1,0 +1,53 @@
+services:
+  country-service:
+    image: wiremock/wiremock:latest
+    ports:
+      - "8088:8080"
+    volumes:
+      - ./wiremock:/home/wiremock
+    command: ["--global-response-templating"]
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: supplierdb
+      POSTGRES_USER: supplier
+      POSTGRES_PASSWORD: supplier
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supplier -d supplierdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    ports:
+      - "8080:8080"
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/supplierdb
+      DB_USER: supplier
+      DB_PASS: supplier
+      COUNTRY_SERVICE_URL: http://country-service:8080
+    depends_on:
+      db:
+        condition: service_healthy
+      country-service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/suppliers/potential?rate=250 > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  postgres-data:
