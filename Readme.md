@@ -1,4 +1,4 @@
-# Solution — Inditex Supplier Management
+# Solution — Supplier Management
 
 ## How to Start
 
