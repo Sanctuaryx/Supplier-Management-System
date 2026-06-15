@@ -1,186 +1,174 @@
-# Technical Test — Full-Stack Engineer
+# Solution — Inditex Supplier Management
 
-## Inditex Supplier Management
+## How to Start
 
-Inditex manages a large network of suppliers. This technical test evaluates your ability to design and implement a **full-stack** solution covering both the backend business logic and the frontend user interface.
+```bash
+docker compose up --build
+```
+
+| Service | URL |
+|---|---|
+| Frontend | http://localhost:3000 |
+| Backend API | http://localhost:8080 |
+| Country mock | http://localhost:8088 |
+
+The first build takes a few minutes (Maven downloads dependencies, npm installs packages). Subsequent builds are faster thanks to Docker layer caching.
+
+### Loading test data
+
+Once the stack is up, seed the database with representative data for all workflow scenarios:
+
+```bash
+docker compose exec -T db psql -U supplier -d supplierdb < seed-data.sql
+```
+
+See [seed-data.sql](seed-data.sql) for a breakdown of what each row exercises.
 
 ---
 
-## 1. Business Context
+## Tech Stack
 
-Inditex supplier management follows the lifecycle shown below:
-
-![FSM Supplier](wiki/iop-techtest-fsm-supplier.png)
-
-### Supplier Lifecycle
-
-Any supplier can apply as a candidate to work with Inditex. To do so, it must provide the following mandatory data:
-
-| Field                | Description                                                                                      |
-|----------------------|--------------------------------------------------------------------------------------------------|
-| **Name**             | Supplier name                                                                                    |
-| **DUNS**             | [Data Universal Numbering System](https://en.wikipedia.org/wiki/Data_Universal_Numbering_System) |
-| **Country**          | ISO 3166-1 alpha-2 code                                                                          |
-| **Annual Turnover**  | Annual turnover (in euros)                                                                       |
-
-Upon application, a supervisor may **accept** or **refuse** the candidate.
-
-**Acceptance rules:**
-
-- A candidate **cannot be accepted** if their country is on the **non-approved countries list** or if their annual turnover is **less than one million euros**.
-- Acceptance requires the supervisor to indicate the initial **sustainability rating**.
-
-**Sustainability rating:** a grade assigned to the supplier from A to E (A = best, E = worst).
-
-- Rating **A or B** → the supplier becomes **Active**.
-- Rating **C, D, or E** → the supplier is placed **On Probation**.
-
-**Other actions:**
-
-- A refused candidacy allows the candidate to reapply.
-- A supervisor may **ban** a supplier on probation. A banned (disqualified) supplier will not be allowed to become a supplier again, even by reapplying.
-
-### Integrity Rules
-
-- An active candidate is one whose candidacy has not been refused.
-- For a given DUNS, only **one active candidacy** can exist.
-- For a given DUNS, only **one supplier** can exist.
-- There cannot be simultaneously an active candidate and a supplier for the same DUNS.
-- The API does not distinguish between "Active" and "On Probation": the `status` field returns `Active` for both states.
-
-### Potential Suppliers
-
-The system must be able to obtain the list of **potential suppliers** for an order given its amount (*rate*).
-
-**Eligibility criteria:**
-
-- A supplier is eligible if their annual turnover is **greater than the order amount**.
-- A **disqualified** supplier cannot be a potential supplier.
-
-**Score calculation:**
-
-```
-score = annual_turnover × 0.1 × rating_constant
-```
-
-| Rating  | Constant |
-|---------|----------|
-| A       | 1        |
-| B       | 0.75     |
-| C       | 0.5      |
-| D       | 0.25     |
-| E       | 0.1      |
-
-**Small supplier bonus:**
-
-A **25%** bonus is applied to all suppliers whose annual turnover is one of the **two lowest unique annual turnovers** in their country.
-
-> **Example:** Given 5 suppliers in a country (s1:200k, s2:200k, s3:200k, s4:210k, s5:250k), the two lowest unique turnovers are 200k and 210k. Therefore, s1, s2, s3, and s4 receive the bonus.
+| Layer | Technology |
+|---|---|
+| Backend framework | Spring Boot 3.5.14 / Java 21 |
+| Persistence | PostgreSQL 16, Spring Data JPA, Flyway |
+| HTTP client | Spring `RestClient` (introduced in 3.2) |
+| Configuration | `@ConfigurationProperties` record |
+| Testing | JUnit 5, Testcontainers, WireMock 3.6.0 |
+| Frontend framework | React 18 + TypeScript 5 |
+| Build tool | Vite 5 |
+| Styling | Tailwind CSS 3 |
+| Data fetching | TanStack Query v5 |
+| Frontend tests | Vitest + Testing Library |
+| Runtime images | `eclipse-temurin:21-jre-alpine`, `nginx:stable-alpine` |
 
 ---
 
-## 2. Technical Requirements
+## Architecture Decisions
+
+### Hexagonal (Ports & Adapters) Architecture
+
+The domain layer (`domain/model/`, `domain/exception/`, `domain/port/`) has zero Spring dependencies. This means:
+- Domain logic is tested with pure JUnit 5 — no Spring context startup
+- The ports (interfaces) are the contract; infrastructure adapts to them
+- Swapping PostgreSQL for another database, or the country HTTP client for a queue consumer, requires changing only the infrastructure layer
+
+The dependency flow is strict: **domain → application → infrastructure (persistence/rest)**. Inbound: HTTP request → controller → service → domain aggregate → repository port → JPA adapter.
+
+### Application Layer: Service Classes
+
+The application layer exposes two services:
+
+- **`CandidateService`** — create, get, accept, refuse candidacies
+- **`SupplierService`** — get supplier, ban supplier, get potential suppliers
+
+Each method is a single transaction boundary.
+
+### Database Design
+
+Two tables: `candidates` (candidacy lifecycle) and `suppliers` (verified suppliers):
+
+- DUNS is the primary key on both tables — the "one supplier per DUNS" invariant is enforced at the DB level as defense-in-depth
+- `CHECK` constraints on `status` and `rating` columns mirror domain invariants
+- Two partial indexes `WHERE status != 'DISQUALIFIED'` cover the most common query pattern (non-disqualified lookup and score ranking) and stay small at scale since disqualified rows are excluded
+
+### Potential Suppliers — Single SQL Query with Window Functions
+
+The score and bonus calculation runs entirely in PostgreSQL via a single CTE. Key choices:
+
+1. **`DENSE_RANK()`** (not `RANK()`) handles tied turnovers. `RANK` assigns ranks 1, 1, 3 for two equal values — leaving the third at rank 3 and incorrectly skipping it out of the bonus pool. `DENSE_RANK` assigns 1, 1, 2 so the second unique value is at rank 2.
+
+2. **The bonus pool uses all non-disqualified suppliers** in a country. The spec defines the two lowest unique turnovers per country without rate-scoping — a supplier counts toward the country's pool even if they don't appear in the current result set.
+
+3. **`COUNT(*) OVER ()`** computes the total matching rows in the same pass as the SELECT, avoiding a second round-trip for pagination metadata.
+
+4. **`LIMIT`/`OFFSET` pagination** — acceptable here because page size is capped at 10 and the query is already rate-filtered. Cursor-based pagination would be preferred for high-cardinality unbounded queries.
+
+### Status Mapping: Internal vs API
+
+Internally: `ACTIVE`, `ON_PROBATION`, `DISQUALIFIED`. The API contract exposes only `Active` and `Disqualified`. The mapping lives exclusively in `SupplierApiMapper.toApiStatus()`. Neither the domain nor the persistence layer knows about the API's simplified view.
+
+### Country Service Client
+
+`CountryServiceClient` implements the `CountryService` port using Spring's `RestClient`. It throws `CountryNotFoundException` on a 404 from the external service, which `GlobalExceptionHandler` maps to HTTP 422 (Unprocessable Content).
+
+Rationale: a 404 from the country service means the country code is not recognized — this is a semantic error in the caller's request, not a missing resource in our own system.
+
+The client's base URL is bound via a typed `@ConfigurationProperties` record (`CountryServiceProperties`), replacing a raw `@Value` injection. This provides IDE autocompletion, null-safety analysis, and compile-time binding validation.
+
+### OpenAPI Conformance
+
+All endpoints are validated against `wiki/itx-iop_tech-supplier_flow-main-openapi3_1.yaml`. One gap that was identified and fixed: `POST /candidates` listed HTTP 422 in the spec but the implementation never triggered it. Fixed by calling `countryService.isBanned(country)` at the start of `createCandidate` — if the country is unknown, `CountryNotFoundException` propagates and the global handler returns 422.
+
+### Frontend State Architecture
+
+- **Server state**: TanStack Query. Loading, error, stale, and cache states are handled automatically. `staleTime: 30s` prevents redundant refetches while the user filters or sorts.
+- **UI state**: `useState` in `PotentialSuppliersPage`. `submittedRate` is set only on form submit (not on every keystroke) to avoid fetching on every key press.
+- **Derived state**: filtering and sorting are pure `useMemo` transformations over the fetched page — no extra state for the filtered result set.
+- **Pagination**: server-side via `limit`/`offset`. Filtering is client-side over the current page — the API has no filter parameters beyond `rate`.
+- **nginx proxy**: the frontend image proxies `/suppliers` and `/candidates` to the backend container, eliminating CORS with no backend configuration.
+
+---
+
+## Docker
+
+Both images use multi-stage builds. The build stage (Maven / Node) is discarded; only the runtime artifact is in the final image.
+
+```
+Backend:  eclipse-temurin:21-jre-alpine  + apk upgrade --no-cache
+Frontend: nginx:stable-alpine            + apk upgrade --no-cache
+```
+
+`apk upgrade --no-cache` patches all Alpine packages on every build, keeping the images clean of known CVEs regardless of when the base image was last updated. The build stage also runs `apk upgrade` so Maven and its transitive downloads are not the source of leaked CVEs.
+
+---
+
+## Running Tests
 
 ### Backend
 
-The test consists of developing a service to manage Inditex suppliers according to the business logic described above.
+```bash
+cd backend
 
-**Operations to implement (REST API):**
+# Unit tests only (no Docker required)
+./mvnw test
 
-Endpoints, request/response schemas, and status codes are defined in the OpenAPI specification: [wiki/itx-iop_tech-supplier_flow-main-openapi3_1.yaml](wiki/itx-iop_tech-supplier_flow-main-openapi3_1.yaml).
+# All tests including integration (requires Docker for Testcontainers)
+./mvnw verify
+```
 
-Use it as the single source of truth for the API contract.
-
-**External service — Country lookup:**
-
-The backend must query an external service to check whether a country is banned.
-
-The contract is defined in the OpenAPI specification: [wiki/itx-iop_tech-supplier_flow-country-openapi3_1.yaml](wiki/itx-iop_tech-supplier_flow-country-openapi3_1.yaml).
-
-A mock of this service is already provided in [docker-compose.yml](docker-compose.yml) via WireMock.
+Integration tests spin up a real PostgreSQL container and a WireMock server. WireMock uses `wiremock-standalone` to avoid classpath conflicts with Jetty.
 
 ### Frontend
 
-Build a **potential suppliers dashboard** that consumes the backend API.
+```bash
+cd frontend
+npm install
+npm test
+```
 
-**Frontend requirements:**
-
-| Feature              | Description                                                                                                        |
-|----------------------|--------------------------------------------------------------------------------------------------------------------|
-| Amount input         | Numeric input field for the order amount (*rate*), minimum 250, with a search button                               |
-| Results table        | Columns: DUNS, Name, Country, Annual Turnover (currency format €), Sustainability Rating, Score (2 decimal places) |
-| Default sort         | Results sorted by **score descending**                                                                             |
-| Loading state        | Loading indicator while API requests are in progress                                                               |
-| Error handling       | User-friendly error message when the API fails or returns an error                                                 |
-| Empty state          | Message when no suppliers match the criteria                                                                       |
-| Input validation     | Minimum value of 250, display validation message if not met                                                        |
-| Client-side search   | Filter results by supplier name or DUNS                                                                            |
-| Column sorting       | Allow sorting by clicking on table headers, toggling ascending/descending                                          |
-| Country filter       | Dropdown or multi-select to filter results by country                                                              |
-| Rating filter        | Filter results by sustainability rating (A, B, C, D, E)                                                            |
-| Pagination           | Pagination controls using `limit` and `offset`                                                                     |
-| Result count         | Display the total number of matching suppliers                                                                     |
-| Turnover formatting  | Use thousand separators and the € currency symbol                                                                  |
+Three test suites:
+- `filterAndSort.test.ts` — pure unit tests for the filter/sort utilities
+- `SearchBar.test.tsx` — user interaction: validation errors, submit fires callback
+- `SuppliersTable.test.tsx` — rendering: loading state, error state, empty state, data rows, sort header clicks
 
 ---
 
-## 3. Provided Resources
+## Trade-offs and Gaps
 
-The main API contract is defined in [wiki/itx-iop_tech-supplier_flow-main-openapi3_1.yaml](wiki/itx-iop_tech-supplier_flow-main-openapi3_1.yaml).
-
-The country lookup contract is defined in [wiki/itx-iop_tech-supplier_flow-country-openapi3_1.yaml](wiki/itx-iop_tech-supplier_flow-country-openapi3_1.yaml).
-
-The supplier lifecycle diagram is available in [wiki/iop-techtest-fsm-supplier.png](wiki/iop-techtest-fsm-supplier.png).
-
----
-
-## 4. Technology Stack
-
-| Layer              | Recommendation                                                                                              |
-|--------------------|-------------------------------------------------------------------------------------------------------------|
-| **Backend**        | Free choice of language and framework.                                                                      |
-| **Frontend**       | Web SPA application.                                                                                        |
-| **Persistence**    | A relational database is recommended.                                                                       |
-| **Infrastructure** | **Docker Compose** to orchestrate all services (backend, frontend, database, country service is provided).  |
-
-> **Updating provided `docker-compose.yml` is mandatory** that allows starting the entire solution with a single command (`docker compose up`). The evaluator must be able to run the complete application without needing to install any SDKs or additional dependencies.
+| Area | Decision | Reason |
+|---|---|---|
+| No authentication | Skipped | Out of scope for this test |
+| Optimistic locking | Not implemented | Concurrent accepts on the same DUNS are caught by the PK constraint → `DataIntegrityViolationException` → 409 |
+| Country service resilience | No circuit breaker | Resilience4j would be added in production; complexity not warranted here |
+| Client-side filtering | Applied to current page only | The API has no filter params beyond `rate`; this is the natural boundary |
+| Cursor pagination | Using `LIMIT`/`OFFSET` | Matches the OpenAPI spec exactly; cursor pagination would require API changes |
 
 ---
 
-## 5. Test Approach
+## Notable Considerations
 
-All requirements described in this document are part of the implementation.
-
-Prioritize the core zone (business logic, domain model) over infrastructure or boilerplate, but if you make any trade-off or leave any gap, document it explicitly.
-
----
-
-## 6. Evaluation Criteria
-
-| Criterion                       | Description                                                                |
-|---------------------------------|----------------------------------------------------------------------------|
-| **Architecture and design**     | DDD principles, separation of concerns, clean architecture                 |
-| **Business logic**              | Correct implementation of business rules                                   |
-| **Code quality**                | Readability, naming, idiomatic usage of the chosen language                |
-| **Testing**                     | Unit and integration tests for the parts you consider relevant             |
-| **Performance and scalability** | Consider that the supplier volume is in the range of 100,000 to 1,000,000  |
-| **Frontend components**         | Component architecture, state management, UX                               |
-| **Docker Compose**              | Fully bootable solution with `docker compose up`                           |
-| **Documentation**               | Document relevant decisions and noteworthy aspects                         |
-
----
-
-## 7. Delivery
-
-1. Deliver the code in the provided **Git repository**.
-2. Must include:
-   - Backend and frontend source code.
-   - A working `docker-compose.yml` at the project root.
-   - A `SOLUTION.md` with:
-     - Instructions to start the solution.
-     - Technical decisions and justification.
-     - Aspects left out and why.
-     - Any relevant considerations.
-3. Verify that `docker compose up` starts the complete solution and the APIs are accessible.
-
----
+- **WireMock stub convention**: countries starting A–M are not banned, N–Z are banned. Integration tests and the acceptance flow rely on this.
+- **Integration test** (`SupplierIntegrationTest`): spins up real PostgreSQL via Testcontainers and a real WireMock server. Exercises the SQL window function query, Flyway migration, and the HTTP client together in one test.
+- **Seed data** (`seed-data.sql`): 12 suppliers across ES/FR/PT/IT (all rating and status combinations), 3 candidates (PENDING, REFUSED, ACCEPTED-then-banned), designed to exercise pagination, the bonus calculation across countries with 1/2/3+ entries, and all error paths.
+- **`@ConfigurationProperties` processor**: `spring-boot-configuration-processor` is declared as an optional dependency so the IDE resolves `country-service.base-url` in `application.yml` with autocompletion and no unknown-property warnings.
